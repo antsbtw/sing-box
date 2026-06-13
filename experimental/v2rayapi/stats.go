@@ -60,6 +60,36 @@ func NewStatsService(options option.V2RayStatsServiceOptions) *StatsService {
 	}
 }
 
+// isCountedUser reports whether per-user traffic accounting is enabled for the
+// given user name. The users set can be mutated at runtime by UpdateUsers
+// (hot reload), so the read is guarded by the same mutex as the writer.
+func (s *StatsService) isCountedUser(user string) bool {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.users[user]
+}
+
+// UpdateUsers replaces the set of users eligible for per-user traffic
+// accounting at runtime, so that users hot-added to a hysteria2 inbound (which
+// bypasses a full config reload) are still billed. It mirrors the full-set /
+// idempotent semantics of the hysteria2 inbound UpdateUsers: pass the complete
+// list of user names (=UUIDs) that should currently be counted.
+//
+// Existing counters for users that remain in the set are preserved (the
+// counters map is keyed by "user>>>NAME>>>..." and is not touched here), so
+// accumulated byte counts are continuous across updates. Counters for removed
+// users are left in place and simply stop incrementing; they can still be read
+// or reset via the normal StatsService RPCs.
+func (s *StatsService) UpdateUsers(users []string) {
+	newUsers := make(map[string]bool, len(users))
+	for _, user := range users {
+		newUsers[user] = true
+	}
+	s.access.Lock()
+	s.users = newUsers
+	s.access.Unlock()
+}
+
 func (s *StatsService) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	inbound := metadata.Inbound
 	user := metadata.User
@@ -68,7 +98,7 @@ func (s *StatsService) RoutedConnection(ctx context.Context, conn net.Conn, meta
 	var writeCounter []*atomic.Int64
 	countInbound := inbound != "" && s.inbounds[inbound]
 	countOutbound := outbound != "" && s.outbounds[outbound]
-	countUser := user != "" && s.users[user]
+	countUser := user != "" && s.isCountedUser(user)
 	if !countInbound && !countOutbound && !countUser {
 		return conn
 	}
@@ -97,7 +127,7 @@ func (s *StatsService) RoutedPacketConnection(ctx context.Context, conn N.Packet
 	var writeCounter []*atomic.Int64
 	countInbound := inbound != "" && s.inbounds[inbound]
 	countOutbound := outbound != "" && s.outbounds[outbound]
-	countUser := user != "" && s.users[user]
+	countUser := user != "" && s.isCountedUser(user)
 	if !countInbound && !countOutbound && !countUser {
 		return conn
 	}

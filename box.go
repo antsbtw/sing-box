@@ -24,6 +24,7 @@ import (
 	"github.com/sagernet/sing-box/experimental"
 	"github.com/sagernet/sing-box/experimental/cachefile"
 	"github.com/sagernet/sing-box/experimental/deprecated"
+	"github.com/sagernet/sing-box/experimental/hotreload"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/direct"
@@ -145,6 +146,7 @@ func New(options Options) (*Box, error) {
 	var needCacheFile bool
 	var needClashAPI bool
 	var needV2RayAPI bool
+	var needHotReload bool
 	if experimentalOptions.CacheFile != nil && experimentalOptions.CacheFile.Enabled || options.PlatformLogWriter != nil {
 		needCacheFile = true
 	}
@@ -153,6 +155,9 @@ func New(options Options) (*Box, error) {
 	}
 	if experimentalOptions.V2RayAPI != nil && experimentalOptions.V2RayAPI.Listen != "" {
 		needV2RayAPI = true
+	}
+	if experimentalOptions.HotReload != nil && experimentalOptions.HotReload.Listen != "" {
+		needHotReload = true
 	}
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
 	var defaultLogWriter io.Writer
@@ -402,8 +407,9 @@ func New(options Options) (*Box, error) {
 		service.MustRegister[adapter.ClashServer](ctx, clashServer)
 		internalServices = append(internalServices, clashServer)
 	}
+	var v2rayServer adapter.V2RayServer
 	if needV2RayAPI {
-		v2rayServer, err := experimental.NewV2RayServer(logFactory.NewLogger("v2ray-api"), common.PtrValueOrDefault(experimentalOptions.V2RayAPI))
+		v2rayServer, err = experimental.NewV2RayServer(logFactory.NewLogger("v2ray-api"), common.PtrValueOrDefault(experimentalOptions.V2RayAPI))
 		if err != nil {
 			return nil, E.Cause(err, "create v2ray-server")
 		}
@@ -411,7 +417,21 @@ func New(options Options) (*Box, error) {
 			router.AppendTracker(v2rayServer.StatsService())
 			internalServices = append(internalServices, v2rayServer)
 			service.MustRegister[adapter.V2RayServer](ctx, v2rayServer)
+		} else {
+			v2rayServer = nil
 		}
+	}
+	if needHotReload {
+		// Pass the concrete inbound manager and v2ray server directly rather than
+		// resolving them from the context registry at request time: this box's
+		// own instances are unambiguous, whereas a shared/default registry (as in
+		// the test harness, where many boxes share one) could otherwise hand back
+		// another instance's manager.
+		hotReloadServer, err := hotreload.NewServer(logFactory.NewLogger("hot-reload"), common.PtrValueOrDefault(experimentalOptions.HotReload), inboundManager, v2rayServer)
+		if err != nil {
+			return nil, E.Cause(err, "create hot-reload server")
+		}
+		internalServices = append(internalServices, hotReloadServer)
 	}
 	if ntpOptions.Enabled {
 		ntpDialer, err := dialer.New(ctx, ntpOptions.DialerOptions, ntpOptions.ServerIsDomain())

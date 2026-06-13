@@ -6,7 +6,20 @@ type ExperimentalOptions struct {
 	CacheFile *CacheFileOptions `json:"cache_file,omitempty"`
 	ClashAPI  *ClashAPIOptions  `json:"clash_api,omitempty"`
 	V2RayAPI  *V2RayAPIOptions  `json:"v2ray_api,omitempty"`
+	HotReload *HotReloadOptions `json:"hot_reload,omitempty"`
 	Debug     *DebugOptions     `json:"debug,omitempty"`
+}
+
+// HotReloadOptions configures the local hot-reload control endpoint, which lets
+// an external agent push the full set of hysteria2 users at runtime without a
+// full config reload (so existing connections are not dropped). It binds a
+// loopback address and has no authentication; do not expose it off-host.
+type HotReloadOptions struct {
+	// Listen is the address:port to bind, e.g. "127.0.0.1:8023". Required.
+	Listen string `json:"listen,omitempty"`
+	// InboundTag is the tag of the hysteria2 inbound whose users are hot-updated.
+	// Required.
+	InboundTag string `json:"inbound_tag,omitempty"`
 }
 
 type CacheFileOptions struct {
