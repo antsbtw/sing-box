@@ -75,9 +75,20 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	// Capture the inbound-wide flow for hot-added users. The fleet uses a uniform
 	// flow per VLESS inbound (xtls-rprx-vision everywhere, manager hardcoded), so
-	// the first configured user's flow defines it; absent users it stays "".
+	// the first configured user's flow defines it.
 	if len(options.Users) > 0 {
 		inbound.flow = options.Users[0].Flow
+	}
+	// CRITICAL: if the inbound starts with an empty user set (the agent writes an
+	// empty "users":[] when it has not yet fetched the user list, then seeds users
+	// via the hot-reload endpoint), inbound.flow would stay "" and every
+	// hot-added user would inherit flow="" — mismatching clients that use
+	// xtls-rprx-vision, so every NEW handshake fails the auth and the client sees
+	// EOF / "processed invalid connection" (old connections keep working because
+	// they cached auth). The whole fleet uses xtls-rprx-vision uniformly, so fall
+	// back to it when no configured user pinned the flow.
+	if inbound.flow == "" {
+		inbound.flow = vless.FlowVision
 	}
 	inbound.userToIndex = make(map[string]int)
 	emptyUsers := []option.VLESSUser{}
