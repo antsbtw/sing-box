@@ -17,9 +17,17 @@ type ExperimentalOptions struct {
 type HotReloadOptions struct {
 	// Listen is the address:port to bind, e.g. "127.0.0.1:8023". Required.
 	Listen string `json:"listen,omitempty"`
-	// InboundTag is the tag of the hysteria2 inbound whose users are hot-updated.
-	// Required.
+	// InboundTag is the tag of a single inbound whose users are hot-updated.
+	// Kept for backward compatibility (realm single-hy2 deployments). Either
+	// InboundTag or InboundTags must be set; if both are set they are merged.
 	InboundTag string `json:"inbound_tag,omitempty"`
+	// InboundTags lists multiple inbound tags to hot-update in one call (e.g.
+	// vless-in + hy2-in on standard nodes). All listed inbounds receive the same
+	// full user set in a single /hotreload/users call. Each must implement
+	// UpdateUsers with name==password==UUID semantics (vless / hysteria2);
+	// protocols whose auth is not UUID-based (e.g. shadowsocks PSK) must NOT be
+	// listed here — they would reject all users.
+	InboundTags []string `json:"inbound_tags,omitempty"`
 }
 
 type CacheFileOptions struct {

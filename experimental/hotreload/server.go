@@ -55,7 +55,7 @@ type userSetUpdater interface {
 type Server struct {
 	logger         log.ContextLogger
 	listen         string
-	inboundTag     string
+	inboundTags    []string
 	inboundManager adapter.InboundManager
 	v2rayServer    adapter.V2RayServer // may be nil if v2ray_api is not enabled
 	httpServer     *http.Server
@@ -63,14 +63,28 @@ type Server struct {
 }
 
 // NewServer builds a hot-reload control server bound to options.Listen, targeting
-// the hysteria2 inbound identified by options.InboundTag. The inbound manager is
-// required; v2rayServer may be nil (billing sync is then skipped).
+// the inbound(s) identified by options.InboundTag and/or options.InboundTags. The
+// inbound manager is required; v2rayServer may be nil (billing sync is then
+// skipped). All target inbounds receive the same full user set per call.
 func NewServer(logger log.ContextLogger, options option.HotReloadOptions, inboundManager adapter.InboundManager, v2rayServer adapter.V2RayServer) (*Server, error) {
 	if options.Listen == "" {
 		return nil, E.New("hot_reload: missing listen address")
 	}
-	if options.InboundTag == "" {
-		return nil, E.New("hot_reload: missing inbound_tag")
+	// Merge single InboundTag (backward compat) + InboundTags, deduplicated.
+	seen := make(map[string]struct{})
+	var tags []string
+	for _, t := range append([]string{options.InboundTag}, options.InboundTags...) {
+		if t == "" {
+			continue
+		}
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		tags = append(tags, t)
+	}
+	if len(tags) == 0 {
+		return nil, E.New("hot_reload: missing inbound_tag / inbound_tags")
 	}
 	if inboundManager == nil {
 		return nil, E.New("hot_reload: nil inbound manager")
@@ -78,7 +92,7 @@ func NewServer(logger log.ContextLogger, options option.HotReloadOptions, inboun
 	return &Server{
 		logger:         logger,
 		listen:         options.Listen,
-		inboundTag:     options.InboundTag,
+		inboundTags:    tags,
 		inboundManager: inboundManager,
 		v2rayServer:    v2rayServer,
 	}, nil
@@ -102,7 +116,7 @@ func (s *Server) Start(stage adapter.StartStage) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/hotreload/users", s.handleUpdateUsers)
 	s.httpServer = &http.Server{Handler: mux}
-	s.logger.Info("hot-reload control endpoint started at ", listener.Addr(), " (inbound ", s.inboundTag, ")")
+	s.logger.Info("hot-reload control endpoint started at ", listener.Addr(), " (inbounds ", strings.Join(s.inboundTags, ","), ")")
 	go func() {
 		err := s.httpServer.Serve(listener)
 		if err != nil && err != http.ErrServerClosed {
@@ -166,24 +180,31 @@ func (s *Server) handleUpdateUsers(w http.ResponseWriter, r *http.Request) {
 		uuids = append(uuids, u.UUID)
 	}
 
-	inbound, found := s.inboundManager.Get(s.inboundTag)
-	if !found {
-		tags := make([]string, 0)
-		for _, in := range s.inboundManager.Inbounds() {
-			tags = append(tags, in.Tag())
+	// Update every configured inbound with the same full user set. All target
+	// inbounds use name==password==UUID semantics (vless / hysteria2). A single
+	// inbound failing (not found / wrong type / update error) fails the whole
+	// call so the agent falls back to reload — we do not want partial state where
+	// one protocol has the new user set and another does not.
+	for _, tag := range s.inboundTags {
+		inbound, found := s.inboundManager.Get(tag)
+		if !found {
+			known := make([]string, 0)
+			for _, in := range s.inboundManager.Inbounds() {
+				known = append(known, in.Tag())
+			}
+			s.logger.Warn("hot_reload: inbound ", tag, " not found; known tags: ", strings.Join(known, ","))
+			s.writeError(w, http.StatusNotFound, "inbound not found: "+tag)
+			return
 		}
-		s.logger.Warn("hot_reload: inbound ", s.inboundTag, " not found; known tags: ", strings.Join(tags, ","))
-		s.writeError(w, http.StatusNotFound, "inbound not found: "+s.inboundTag)
-		return
-	}
-	updater, ok := inbound.(userUpdater)
-	if !ok {
-		s.writeError(w, http.StatusBadRequest, "inbound "+s.inboundTag+" (type "+inbound.Type()+") does not support hot user update")
-		return
-	}
-	if err := updater.UpdateUsers(uuids, uuids); err != nil {
-		s.writeError(w, http.StatusInternalServerError, E.Cause(err, "update inbound users").Error())
-		return
+		updater, ok := inbound.(userUpdater)
+		if !ok {
+			s.writeError(w, http.StatusBadRequest, "inbound "+tag+" (type "+inbound.Type()+") does not support hot user update")
+			return
+		}
+		if err := updater.UpdateUsers(uuids, uuids); err != nil {
+			s.writeError(w, http.StatusInternalServerError, E.Cause(err, "update inbound users ("+tag+")").Error())
+			return
+		}
 	}
 
 	// Keep billing in sync: refresh the v2ray_api stats user set so hot-added
