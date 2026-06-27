@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -36,6 +38,17 @@ type Inbound struct {
 	listener                 *listener.Listener
 	service                  *trojan.Service[int]
 	users                    []option.TrojanUser
+	// userNameList is indexed by the int user value the trojan service assigns at
+	// auth time (carried through ctx to newConnection). Read on every routed
+	// connection and swapped wholesale by UpdateUsers (hot reload), so held in an
+	// atomic.Pointer to stay race-free. Index assignments are STABLE across
+	// reloads (see updateAccess / nameToIndex) so billing never gets
+	// misattributed when the user set changes under a live connection.
+	userNameList atomic.Pointer[[]string]
+	// updateAccess serialises UpdateUsers and guards nameToIndex. Read path does
+	// not take this lock.
+	updateAccess             sync.Mutex
+	nameToIndex              map[string]int
 	tlsConfig                tls.ServerConfig
 	fallbackAddr             M.Socksaddr
 	fallbackAddrTLSNextProto map[string]M.Socksaddr
@@ -87,11 +100,16 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		fallbackHandler = adapter.NewUpstreamContextHandler(inbound.fallbackConnection, nil)
 	}
 	service := trojan.NewService[int](adapter.NewUpstreamContextHandler(inbound.newConnection, inbound.newPacketConnection), fallbackHandler, logger)
-	err := service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.TrojanUser) int {
-		return index
-	}), common.Map(options.Users, func(it option.TrojanUser) string {
-		return it.Password
-	}))
+	inbound.service = service
+	inbound.nameToIndex = make(map[string]int)
+	emptyList := make([]string, 0)
+	inbound.userNameList.Store(&emptyList)
+	// Initial users go through the same stable-index path as hot reload so the
+	// service, nameToIndex and userNameList all stay consistent from the start.
+	err := inbound.UpdateUsers(
+		common.Map(options.Users, func(it option.TrojanUser) string { return it.Name }),
+		common.Map(options.Users, func(it option.TrojanUser) string { return it.Password }),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -105,7 +123,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
-	inbound.service = service
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -189,7 +206,7 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	user := h.userNameByIndex(userIndex)
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {
@@ -207,7 +224,7 @@ func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, me
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	user := h.userNameByIndex(userIndex)
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {
@@ -215,6 +232,110 @@ func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, me
 	}
 	h.logger.InfoContext(ctx, "[", user, "] inbound packet connection to ", metadata.Destination)
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
+}
+
+// userNameByIndex resolves the billing/display name for the int user value the
+// trojan service assigned at auth time. Race-free via the atomic snapshot.
+func (h *Inbound) userNameByIndex(userIndex int) string {
+	nameList := *h.userNameList.Load()
+	if userIndex < 0 || userIndex >= len(nameList) {
+		return ""
+	}
+	return nameList[userIndex]
+}
+
+// UpdateUsers hot-reloads the full trojan user set (full-set / idempotent) without
+// dropping existing connections. names[i] is the user name (billing/display, =UUID
+// for otun) and passwords[i] the trojan password. Index assignments stay stable
+// across reloads so live connections keep resolving to the right name.
+func (h *Inbound) UpdateUsers(names []string, passwords []string) error {
+	if len(names) != len(passwords) {
+		return E.New("trojan: user name/password count mismatch")
+	}
+	h.updateAccess.Lock()
+	defer h.updateAccess.Unlock()
+
+	// trojan auth is by password only; name is for billing/display and may be
+	// empty in upstream configs. Use a stable key per user: the name when set,
+	// else fall back to the password (always unique within a config).
+	keys := make([]string, len(names))
+	for i := range names {
+		if names[i] != "" {
+			keys[i] = names[i]
+		} else {
+			keys[i] = passwords[i]
+		}
+	}
+
+	userList, passwordList, nameList := assignStableIndices(h.nameToIndex, keys, passwords, names)
+	if err := h.service.UpdateUsers(userList, passwordList); err != nil {
+		return err
+	}
+	h.userNameList.Store(&nameList)
+	return nil
+}
+
+// assignStableIndices keeps each user's int index stable across hot reloads.
+// stableKeys[i] identifies user i (name, or password if name empty); displayNames[i]
+// is what ends up in nameList (the billing/display name, may be empty).
+func assignStableIndices(nameToIndex map[string]int, stableKeys []string, passwords []string, displayNames []string) (userList []int, passwordList []string, nameList []string) {
+	newKeySet := make(map[string]struct{}, len(stableKeys))
+	for _, k := range stableKeys {
+		newKeySet[k] = struct{}{}
+	}
+	// Drop stale key->index assignments so slots can be reused; find high-water mark.
+	maxIndex := -1
+	for key, index := range nameToIndex {
+		if _, keep := newKeySet[key]; !keep {
+			delete(nameToIndex, key)
+			continue
+		}
+		if index > maxIndex {
+			maxIndex = index
+		}
+	}
+	used := make(map[int]struct{}, len(nameToIndex))
+	for _, index := range nameToIndex {
+		used[index] = struct{}{}
+	}
+	freeSlots := make([]int, 0)
+	for i := 0; i <= maxIndex; i++ {
+		if _, taken := used[i]; !taken {
+			freeSlots = append(freeSlots, i)
+		}
+	}
+	nextIndex := maxIndex + 1
+	passwordByKey := make(map[string]string, len(stableKeys))
+	nameByKey := make(map[string]string, len(stableKeys))
+	for i, key := range stableKeys {
+		passwordByKey[key] = passwords[i]
+		nameByKey[key] = displayNames[i]
+		if _, ok := nameToIndex[key]; ok {
+			continue
+		}
+		if len(freeSlots) > 0 {
+			nameToIndex[key] = freeSlots[0]
+			freeSlots = freeSlots[1:]
+		} else {
+			nameToIndex[key] = nextIndex
+			nextIndex++
+		}
+	}
+	size := 0
+	for _, index := range nameToIndex {
+		if index+1 > size {
+			size = index + 1
+		}
+	}
+	userList = make([]int, 0, len(nameToIndex))
+	passwordList = make([]string, 0, len(nameToIndex))
+	nameList = make([]string, size)
+	for key, index := range nameToIndex {
+		userList = append(userList, index)
+		passwordList = append(passwordList, passwordByKey[key])
+		nameList[index] = nameByKey[key]
+	}
+	return userList, passwordList, nameList
 }
 
 func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

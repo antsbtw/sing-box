@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"sync/atomic"
 
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
@@ -20,22 +21,33 @@ type Handler interface {
 	N.UDPConnectionHandlerEx
 }
 
+// userTable holds the full user/key set as one immutable snapshot. Hot reload
+// (UpdateUsers) builds a fresh table and swaps the atomic pointer in a single
+// store; read path (NewConnection) loads the pointer once, so a reload never
+// races with an in-flight auth and existing connections keep their snapshot.
+type userTable[K comparable] struct {
+	users map[K][56]byte
+	keys  map[[56]byte]K
+}
+
 type Service[K comparable] struct {
-	users           map[K][56]byte
-	keys            map[[56]byte]K
+	table           atomic.Pointer[userTable[K]]
 	handler         Handler
 	fallbackHandler N.TCPConnectionHandlerEx
 	logger          logger.ContextLogger
 }
 
 func NewService[K comparable](handler Handler, fallbackHandler N.TCPConnectionHandlerEx, logger logger.ContextLogger) *Service[K] {
-	return &Service[K]{
-		users:           make(map[K][56]byte),
-		keys:            make(map[[56]byte]K),
+	s := &Service[K]{
 		handler:         handler,
 		fallbackHandler: fallbackHandler,
 		logger:          logger,
 	}
+	s.table.Store(&userTable[K]{
+		users: make(map[K][56]byte),
+		keys:  make(map[[56]byte]K),
+	})
+	return s
 }
 
 var ErrUserExists = E.New("user already exists")
@@ -54,8 +66,9 @@ func (s *Service[K]) UpdateUsers(userList []K, passwordList []string) error {
 		users[user] = key
 		keys[key] = user
 	}
-	s.users = users
-	s.keys = keys
+	// Single atomic swap; in-flight reads keep their old snapshot, new handshakes
+	// observe the new set. Never disturbs existing connections.
+	s.table.Store(&userTable[K]{users: users, keys: keys})
 	return nil
 }
 
@@ -68,7 +81,7 @@ func (s *Service[K]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		return s.fallback(ctx, conn, source, key[:n], E.New("bad request size"), onClose)
 	}
 
-	if user, loaded := s.keys[key]; loaded {
+	if user, loaded := s.table.Load().keys[key]; loaded {
 		ctx = auth.ContextWithUser(ctx, user)
 	} else {
 		return s.fallback(ctx, conn, source, key[:], E.New("bad request"), onClose)
