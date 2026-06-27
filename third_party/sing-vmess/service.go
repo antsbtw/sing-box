@@ -13,6 +13,8 @@ import (
 	"io"
 	"math"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -42,9 +44,19 @@ var (
 	ErrBadVersion   = E.New("bad version")
 )
 
+// authTable holds the AEAD auth maps (userKey + userIdCipher) as one immutable
+// snapshot, swapped atomically by UpdateUsers so the read path (NewConnection)
+// never races with a hot reload. Only covers the modern AEAD path (alterId==0);
+// the legacy alterId maps below are left as-is (otun nodes never set alterId>0,
+// so those maps stay empty and no background ticker runs — no concurrency there).
+type vmessAuthTable[U comparable] struct {
+	userKey      map[U][16]byte
+	userIdCipher map[U]cipher.Block
+}
+
 type Service[U comparable] struct {
-	userKey              map[U][16]byte
-	userIdCipher         map[U]cipher.Block
+	authTable            atomic.Pointer[vmessAuthTable[U]]
+	updateMu             sync.Mutex // serialises UpdateUsers' non-atomic legacy-map writes
 	replayFilter         replay.Filter
 	handler              Handler
 	time                 func() time.Time
@@ -68,6 +80,10 @@ func NewService[U comparable](handler Handler, options ...ServiceOption) *Servic
 		handler:      handler,
 		time:         time.Now,
 	}
+	service.authTable.Store(&vmessAuthTable[U]{
+		userKey:      make(map[U][16]byte),
+		userIdCipher: make(map[U]cipher.Block),
+	})
 	anyService := (*Service[string])(unsafe.Pointer(service))
 	for _, option := range options {
 		option(anyService)
@@ -103,11 +119,16 @@ func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList 
 			userAlterIds[user] = alterIds
 		}
 	}
-	s.userKey = userKeyMap
-	s.userIdCipher = userIdCipherMap
+	// AEAD auth maps swapped atomically (race-free hot reload of the read path).
+	s.authTable.Store(&vmessAuthTable[U]{userKey: userKeyMap, userIdCipher: userIdCipherMap})
+	// Legacy alterId maps are not on the AEAD read path (otun: alterId==0 → empty,
+	// no background ticker). Still serialise their writes against the ticker's
+	// generateLegacyKeys and concurrent UpdateUsers for defensive correctness.
+	s.updateMu.Lock()
 	s.alterIds = userAlterIds
 	s.alterIdUpdateTime = make(map[U]int64)
-	s.generateLegacyKeys()
+	s.generateLegacyKeysLocked()
+	s.updateMu.Unlock()
 	return nil
 }
 
@@ -140,7 +161,16 @@ func (s *Service[U]) loopGenerateLegacyKeys() {
 	}
 }
 
+// generateLegacyKeys is the ticker entry point; it takes updateMu so it never
+// races with UpdateUsers' legacy-map writes.
 func (s *Service[U]) generateLegacyKeys() {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	s.generateLegacyKeysLocked()
+}
+
+// generateLegacyKeysLocked must be called with updateMu held.
+func (s *Service[U]) generateLegacyKeysLocked() {
 	nowSec := s.time().Unix()
 	endSec := nowSec + CacheDurationSeconds
 	var hashValue [16]byte
@@ -194,11 +224,15 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		}
 	}
 
+	// Load the AEAD auth snapshot once for this connection so a concurrent
+	// UpdateUsers (atomic swap) cannot race with the lookups below.
+	authTable := s.authTable.Load()
+
 	authId := requestBuffer.To(16)
 	var decodedId [16]byte
 	var user U
 	var found bool
-	for currUser, userIdBlock := range s.userIdCipher {
+	for currUser, userIdBlock := range authTable.userIdCipher {
 		userIdBlock.Decrypt(decodedId[:], authId)
 		timestamp := int64(binary.BigEndian.Uint64(decodedId[:]))
 		checksum := binary.BigEndian.Uint32(decodedId[12:])
@@ -232,7 +266,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	}
 
 	ctx = auth.ContextWithUser(ctx, user)
-	cmdKey := s.userKey[user]
+	cmdKey := authTable.userKey[user]
 	var headerReader io.Reader
 	var headerBuffer []byte
 
@@ -247,7 +281,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
 		common.Must(binary.Write(timeHash, binary.BigEndian, legacyTimestamp))
-		userKey := s.userKey[user]
+		userKey := authTable.userKey[user]
 		headerReader = NewStreamReader(reader, userKey[:], timeHash.Sum(nil))
 		headerBuffer = make([]byte, 38)
 		_, err = io.ReadFull(headerReader, headerBuffer)
