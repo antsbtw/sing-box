@@ -36,6 +36,10 @@ type Hysteria2Realm struct {
 type Hysteria2InboundRealm struct {
 	Hysteria2Realm
 	STUNDomainResolver *DomainResolveOptions `json:"stun_domain_resolver,omitempty"`
+	// DirectAddresses 非空 → 固定地址模式（direct mode）：用于固定公网 IP、无 NAT 的节点
+	// （如 AWS SG/JP），跳过 STUN 反射 + 双向打洞对撞，直接上报这些 "IP:port" 给客户端。
+	// 每项为 "host:port"（host 建议直接写节点公网 IP）。空 → 走原 STUN 打洞逻辑。
+	DirectAddresses badoption.Listable[string] `json:"direct_addresses,omitempty"`
 }
 
 type Hysteria2Obfs struct {

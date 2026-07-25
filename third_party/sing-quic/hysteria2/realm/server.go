@@ -34,6 +34,14 @@ type Options struct {
 	STUNServers []string
 	Resolver    Resolver
 	Logger      logger.Logger
+
+	// DirectAddresses 非空 → 固定地址模式（direct mode）：节点是固定公网 IP、无 NAT 的 VPS
+	// （如 AWS SG/JP），无需 STUN 反射 + 双向打洞对撞。节点直接把这些地址（真实公网
+	// IP:port）上报给客户端当"打洞"目标；客户端照常主动发 PunchHello（无需改客户端），
+	// 由于是客户端主动发起、目标是固定地址，其家宽 NAT 会为该会话放行回程（与标准
+	// hysteria2 直连的 NAT 行为一致）——从而绕开"对称 NAT + 打洞对撞失败"。
+	// 空 → 完全走原 STUN + 打洞逻辑（默认，其它节点不受影响）。
+	DirectAddresses []netip.AddrPort
 }
 
 type Server struct {
@@ -64,10 +72,11 @@ func NewServer(options Options) (*Server, error) {
 	if options.RealmID == "" {
 		return nil, E.New("realm ID is required")
 	}
-	if len(options.STUNServers) == 0 {
+	// direct 模式无需 STUN（用固定地址代替反射发现）；仅非 direct 模式强制 STUN。
+	if len(options.DirectAddresses) == 0 && len(options.STUNServers) == 0 {
 		return nil, E.New("at least one STUN server is required")
 	}
-	if options.Resolver == nil {
+	if len(options.DirectAddresses) == 0 && options.Resolver == nil {
 		return nil, E.New("resolver is required")
 	}
 	return &Server{
@@ -230,7 +239,8 @@ func (s *Server) readEvents(ctx context.Context, stream *EventStream, streamDone
 					s.options.Logger.Warn(E.Cause(postErr, "connect response post"))
 				}
 			}
-			result, punchErr := s.puncher.Respond(ctx, generateAttemptID(), freshAddresses, peerAddresses, metadata)
+			passiveOnly := len(s.options.DirectAddresses) > 0
+			result, punchErr := s.puncher.Respond(ctx, generateAttemptID(), freshAddresses, peerAddresses, metadata, passiveOnly)
 			if punchErr != nil {
 				if !E.IsClosedOrCanceled(punchErr) {
 					s.options.Logger.Error(E.Cause(punchErr, "punch respond"))
@@ -252,6 +262,18 @@ func (s *Server) cachedAddresses() []netip.AddrPort {
 }
 
 func (s *Server) connectAddresses(ctx context.Context) ([]netip.AddrPort, error) {
+	// direct 模式：固定公网地址，不跑 STUN。所有地址来源（注册/心跳发布/Connect 应答）
+	// 都经此函数，这一处短路即全覆盖。缓存进 s.addresses 以复用既有发布/注册路径。
+	if len(s.options.DirectAddresses) > 0 {
+		s.addressAccess.Lock()
+		if s.addresses == nil {
+			s.addresses = slices.Clone(s.options.DirectAddresses)
+			s.addressesAt = time.Now()
+		}
+		addrs := slices.Clone(s.addresses)
+		s.addressAccess.Unlock()
+		return addrs, nil
+	}
 	cached := s.cachedAddresses()
 	if cached != nil {
 		return cached, nil

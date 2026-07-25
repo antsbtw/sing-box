@@ -142,12 +142,21 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			return nil, E.Cause(err, "create realm http client")
 		}
 		dnsRouter := service.FromContext[adapter.DNSRouter](ctx)
+		var directAddresses []netip.AddrPort
+		for _, s := range options.Realm.DirectAddresses {
+			ap, parseErr := netip.ParseAddrPort(s)
+			if parseErr != nil {
+				return nil, E.Cause(parseErr, "parse realm direct_addresses: ", s)
+			}
+			directAddresses = append(directAddresses, ap)
+		}
 		realmOptions = &realm.Options{
-			ServerURL:   options.Realm.ServerURL,
-			Token:       options.Realm.Token,
-			RealmID:     options.Realm.RealmID,
-			STUNServers: options.Realm.STUNServers,
-			HTTPClient:  &http.Client{Transport: httpClientTransport},
+			ServerURL:       options.Realm.ServerURL,
+			Token:           options.Realm.Token,
+			RealmID:         options.Realm.RealmID,
+			STUNServers:     options.Realm.STUNServers,
+			DirectAddresses: directAddresses,
+			HTTPClient:      &http.Client{Transport: httpClientTransport},
 			Resolver: func(ctx context.Context, host string, ipv4, ipv6 bool) ([]netip.Addr, error) {
 				dnsOptions := queryOptions
 				switch {
