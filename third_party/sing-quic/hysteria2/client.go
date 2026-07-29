@@ -2,6 +2,7 @@ package hysteria2
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -268,14 +270,22 @@ type realmFamilyConn struct {
 }
 
 func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, error) {
+	// probe 分支埋点：记录 realm 连接七阶段。退出时统一输出一行结构化 JSON，
+	// 供 prober 从 stderr 解析。生产分支无此调用。
+	trace := realm.NewTrace(c.realmOptions.RealmID, "hysteria2")
+	defer c.emitProbeTrace(trace)
+
 	families, err := c.realmOpenFamilies(ctx)
 	if err != nil {
+		trace.Fail(realm.FailStageSTUN, err)
 		return nil, err
 	}
-	surviving, localAddresses, err := c.realmDiscoverFamilies(ctx, families)
+	surviving, localAddresses, stunServers, err := c.realmDiscoverFamilies(ctx, families)
 	if err != nil {
+		trace.Fail(realm.FailStageSTUN, err)
 		return nil, err
 	}
+	trace.STUNDone(localAddresses, stunServers)
 	closeSurviving := func() {
 		for _, family := range surviving {
 			_ = family.conn.Close()
@@ -284,23 +294,60 @@ func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, erro
 	localMetadata, err := realm.GeneratePunchMetadata()
 	if err != nil {
 		closeSurviving()
+		trace.Fail(realm.FailStageRendezvous, err)
 		return nil, E.Cause(err, "generate punch metadata")
 	}
 	response, err := c.controlClient.Connect(ctx, c.realmOptions.RealmID, localAddresses, localMetadata)
 	if err != nil {
 		closeSurviving()
+		trace.Fail(realm.FailStageRendezvous, err)
 		return nil, E.Cause(err, "realm connect")
 	}
-	winner, result, err := c.realmRacePunch(ctx, surviving, response.Addresses, response.PunchMetadata)
+	trace.RendezvousDone(response.Addresses)
+	winner, result, err := c.realmRacePunch(ctx, surviving, response.Addresses, response.PunchMetadata, trace)
 	if err != nil {
+		// 候选为空与打洞超时是两类问题，必须分开归因。
+		stage := realm.FailStagePunch
+		if strings.Contains(err.Error(), "no compatible peer addresses") {
+			stage = realm.FailStageCandidate
+		}
+		trace.Fail(stage, err)
 		return nil, err
 	}
+	trace.PunchDone(result, winner.family, "")
 	packetConn := winner.conn
 	if c.salamanderPassword != "" {
 		packetConn = NewSalamanderConn(packetConn, []byte(c.salamanderPassword))
 	}
 	peerAddr := M.SocksaddrFromNetIP(result.PeerAddr)
-	return c.authenticateAndWrap(ctx, packetConn, peerAddr)
+	conn, err := c.authenticateAndWrap(ctx, packetConn, peerAddr)
+	if err != nil {
+		trace.Fail(realm.FailStageHandshake, err)
+		return nil, err
+	}
+	trace.HandshakeDone()
+	return conn, nil
+}
+
+// mode（punch vs direct）是【节点侧】配置（realm.Options.DirectAddresses 只在
+// server 端设置），客户端无从直接得知。故 mode 不在内核埋点里编造，
+// 由 prober 依据被测节点的已知配置在上报时填入。
+// 客户端能提供的对照证据是 peer_addr_matched：direct 模式下它等于节点的固定
+// 公网地址，打洞模式下通常是 NAT 映射地址。
+
+// emitProbeTrace 把埋点以单行 JSON 输出，前缀固定便于 prober 精确提取。
+//
+// 🔴 注意 tunnel_established 不等于 ok。内核只能证明隧道建起来了；
+// 是否真的可用由 prober 经隧道做真实往返（HTTP 204）判定。
+func (c *Client) emitProbeTrace(trace *realm.Trace) {
+	if c.logger == nil || trace == nil {
+		return
+	}
+	encoded, err := json.Marshal(trace)
+	if err != nil {
+		return
+	}
+	c.logger.Info(realm.ProbeTraceLogPrefix, string(encoded))
 }
 
 func (c *Client) realmOpenFamilies(ctx context.Context) ([]*realmFamilyConn, error) {
@@ -342,10 +389,12 @@ func (c *Client) realmOpenFamilies(ctx context.Context) ([]*realmFamilyConn, err
 	return families, nil
 }
 
-func (c *Client) realmDiscoverFamilies(ctx context.Context, families []*realmFamilyConn) ([]*realmFamilyConn, []netip.AddrPort, error) {
+// realmDiscoverFamilies 额外返回实际响应的 STUN 服务器（埋点用，供 STUN 选点优化）。
+func (c *Client) realmDiscoverFamilies(ctx context.Context, families []*realmFamilyConn) ([]*realmFamilyConn, []netip.AddrPort, []string, error) {
 	type discoverResult struct {
-		addrs []netip.AddrPort
-		err   error
+		addrs   []netip.AddrPort
+		servers []string
+		err     error
 	}
 	results := make([]discoverResult, len(families))
 	var wg sync.WaitGroup
@@ -353,13 +402,15 @@ func (c *Client) realmDiscoverFamilies(ctx context.Context, families []*realmFam
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			addrs, discoverErr := realm.Discover(ctx, family.conn, c.realmOptions.STUNServers, c.realmOptions.Resolver)
-			results[i] = discoverResult{addrs: addrs, err: discoverErr}
+			addrs, servers, discoverErr := realm.DiscoverTraced(ctx, family.conn, c.realmOptions.STUNServers, c.realmOptions.Resolver)
+			results[i] = discoverResult{addrs: addrs, servers: servers, err: discoverErr}
 		}()
 	}
 	wg.Wait()
 	var surviving []*realmFamilyConn
 	var union []netip.AddrPort
+	var stunServers []string
+	seenServer := make(map[string]bool)
 	var errs []error
 	for i, family := range families {
 		result := results[i]
@@ -371,11 +422,17 @@ func (c *Client) realmDiscoverFamilies(ctx context.Context, families []*realmFam
 		family.localAddresses = result.addrs
 		surviving = append(surviving, family)
 		union = append(union, result.addrs...)
+		for _, server := range result.servers {
+			if !seenServer[server] {
+				seenServer[server] = true
+				stunServers = append(stunServers, server)
+			}
+		}
 	}
 	if len(surviving) == 0 {
-		return nil, nil, E.Cause(E.Errors(errs...), "realm STUN discovery")
+		return nil, nil, nil, E.Cause(E.Errors(errs...), "realm STUN discovery")
 	}
-	return surviving, union, nil
+	return surviving, union, stunServers, nil
 }
 
 func (c *Client) realmRacePunch(
@@ -383,6 +440,7 @@ func (c *Client) realmRacePunch(
 	families []*realmFamilyConn,
 	peerAddresses []netip.AddrPort,
 	metadata realm.PunchMetadata,
+	trace *realm.Trace,
 ) (*realmFamilyConn, realm.PunchResult, error) {
 	raceCtx, raceCancel := context.WithCancel(ctx)
 	defer raceCancel()
@@ -394,7 +452,7 @@ func (c *Client) realmRacePunch(
 	out := make(chan outcome, len(families))
 	for _, family := range families {
 		go func() {
-			punchResult, punchErr := realm.Punch(raceCtx, family.conn, family.localAddresses, peerAddresses, metadata)
+			punchResult, punchErr := realm.PunchTraced(raceCtx, family.conn, family.localAddresses, peerAddresses, metadata, trace)
 			out <- outcome{family: family, result: punchResult, err: punchErr}
 		}()
 	}

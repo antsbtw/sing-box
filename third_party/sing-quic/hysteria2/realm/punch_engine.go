@@ -27,7 +27,14 @@ type PunchResult struct {
 }
 
 func Punch(ctx context.Context, conn net.PacketConn, localAddresses []netip.AddrPort, peerAddresses []netip.AddrPort, metadata PunchMetadata) (PunchResult, error) {
+	return PunchTraced(ctx, conn, localAddresses, peerAddresses, metadata, nil)
+}
+
+// PunchTraced 与 Punch 等价，额外把候选计算与每轮 Hello 发送记录进 trace。
+// trace 为 nil 时行为与 Punch 完全一致（生产路径）。仅 probe 分支存在。
+func PunchTraced(ctx context.Context, conn net.PacketConn, localAddresses []netip.AddrPort, peerAddresses []netip.AddrPort, metadata PunchMetadata, trace *Trace) (PunchResult, error) {
 	candidates := candidatePunchAddrs(localAddresses, peerAddresses, conn.LocalAddr())
+	trace.CandidatesComputed(candidates)
 	if len(candidates) == 0 {
 		return PunchResult{}, E.New("no compatible peer addresses")
 	}
@@ -46,6 +53,7 @@ func Punch(ctx context.Context, conn net.PacketConn, localAddresses []netip.Addr
 		now := time.Now()
 		if !now.Before(nextSend) {
 			sendPunchPackets(conn, candidates, PunchHello, metadata)
+			trace.HelloSent()
 			nextSend = now.Add(punchInterval)
 		}
 		deadline := nextSend
