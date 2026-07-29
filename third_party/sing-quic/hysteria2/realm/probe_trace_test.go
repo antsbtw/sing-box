@@ -146,6 +146,11 @@ func TestClassifyErrorPrefersSpecificCause(t *testing.T) {
 		want string
 	}{
 		{"no compatible peer addresses", ErrCodeNoCandidates},
+		// 404 = 节点不认识该用户（没分配），必须区别于凭证错。
+		// 原文同时含 "auth" 与 "404"，靠匹配顺序保证不被归成 auth_failure。
+		{"authentication failed, status code: 404", ErrCodeNotAssigned},
+		{"authentication failed, status code: 401", ErrCodeAuthFailure},
+		{"unauthorized", ErrCodeAuthFailure},
 		{"no STUN responses received", ErrCodeNoSTUNResponse},
 		{"punch timeout: context deadline exceeded", ErrCodeTimeout},
 		{"lookup stun.l.google.com: no such host", ErrCodeDNSFailure},

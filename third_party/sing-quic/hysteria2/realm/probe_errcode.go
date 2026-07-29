@@ -17,6 +17,14 @@ const (
 	ErrCodeTLSFailure        = "tls_failure"
 	ErrCodeAuthFailure       = "auth_failure"
 	ErrCodeHTTPStatus        = "http_status"
+	// ErrCodeNotAssigned：节点不认识这个用户（鉴权返 404）。
+	//
+	// 这**不是节点故障**，而是该账号没被分配到这个节点
+	// （residential 是按需分配主/备，不是全节点可用）。
+	// 与 auth_failure（凭证错/被拒）必须分开：前者说明"没分配"，
+	// 后者说明"分配了但凭证不对"，指向完全不同的处理。
+	// 混在一起会让未分配的健康节点在面板上显示成不可达。
+	ErrCodeNotAssigned = "not_assigned"
 )
 
 // classifyError 按最具体优先匹配。顺序有意义：先匹配具体成因，
@@ -39,6 +47,11 @@ func classifyError(err error) string {
 		return ErrCodeNetworkUnreach
 	case strings.Contains(msg, "x509"), strings.Contains(msg, "tls"), strings.Contains(msg, "certificate"):
 		return ErrCodeTLSFailure
+	// 404 必须先于通用 auth 匹配 —— 原文是
+	// "authentication failed, status code: 404"，同时含 "auth" 与 "404"。
+	// 顺序反了就会被归成 auth_failure，"没分配"和"凭证错"混为一谈。
+	case strings.Contains(msg, "status code: 404"), strings.Contains(msg, "status code 404"):
+		return ErrCodeNotAssigned
 	case strings.Contains(msg, "unauthorized"), strings.Contains(msg, "forbidden"), strings.Contains(msg, "auth"):
 		return ErrCodeAuthFailure
 	case strings.Contains(msg, "unexpected status"), strings.Contains(msg, "status code"):
